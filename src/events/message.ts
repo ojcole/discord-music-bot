@@ -1,4 +1,5 @@
 import { Client } from "discord.js";
+import { buttonRouter } from "../handlers/buttons";
 import { messageRouter } from "../handlers/message";
 
 const registerMessageEvents = (client: Client) => {
@@ -7,6 +8,12 @@ const registerMessageEvents = (client: Client) => {
       return;
     }
     await messageRouter(message);
+  });
+
+  client.on("interactionCreate", async (message) => {
+    if (message.isButton()) {
+      await buttonRouter(message);
+    }
   });
 
   client.on("messageDelete", async (message) => {

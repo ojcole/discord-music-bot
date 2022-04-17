@@ -3,21 +3,33 @@ import {
   AudioPlayerStatus,
   createAudioPlayer,
   createAudioResource,
+  entersState,
   joinVoiceChannel,
   NoSubscriberBehavior,
   VoiceConnection,
+  VoiceConnectionStatus,
 } from "@discordjs/voice";
+import { RBTree } from "bintrees";
 import { Channel, Guild } from "discord.js";
 import ytdl from "ytdl-core-discord";
 
-// import * as path from "path";
+interface QueueEntry {
+  id: bigint;
+  youtubeId: string;
+}
 
 class Player {
-  queue: string[] = [];
+  queue: RBTree<QueueEntry> = new RBTree((a, b) => {
+    if (a.id > b.id) return 1;
+    if (a.id < b.id) return -1;
+    return 0;
+  });
   connection: VoiceConnection;
   audioPlayer: AudioPlayer;
   guild: Guild;
   channelId: string;
+  nextId: bigint = 1n;
+  nextFrontId: bigint = -1n;
 
   constructor(guild: Guild, channel: Channel) {
     this.guild = guild;
@@ -40,6 +52,30 @@ class Player {
       selfDeaf: false,
     });
     this.connection.subscribe(this.audioPlayer);
+    this.connection.on(
+      VoiceConnectionStatus.Disconnected,
+      async (oldState, newState) => {
+        try {
+          this.channelId = "";
+          await Promise.race([
+            entersState(
+              this.connection,
+              VoiceConnectionStatus.Signalling,
+              10_000
+            ),
+            entersState(
+              this.connection,
+              VoiceConnectionStatus.Connecting,
+              10_000
+            ),
+          ]);
+          const channelId = this.connection.joinConfig.channelId;
+          if (channelId !== null) this.channelId = channelId;
+        } catch (error) {
+          this.connection.destroy();
+        }
+      }
+    );
   }
 
   public setVoiceChannel = (channel: Channel, move: boolean): boolean => {
@@ -49,24 +85,48 @@ class Player {
       guildId: this.guild.id,
       channelId: channel.id,
       adapterCreator: this.guild.voiceAdapterCreator,
+      selfMute: false,
+      selfDeaf: false,
     });
     this.connection.subscribe(this.audioPlayer);
     this.channelId = channel.id;
     return true;
   };
 
-  public addToQueue = (youtubeId: string): void => {
-    this.queue.push(youtubeId);
+  public addToQueue = (youtubeId: string): bigint => {
+    const id = this.nextId;
+    this.nextId++;
+    this.queue.insert({ id, youtubeId });
     this.checkPlay();
+    return id;
   };
+
+  public bumpToFront = (id: bigint): bigint => {
+    const entry = this.queue.find({ id, youtubeId: "" });
+    if (entry === null) return 0n;
+    if (!this.queue.remove(entry)) return 0n;
+    const newId = this.nextFrontId;
+    this.nextFrontId--;
+    entry.id = newId;
+    if (!this.queue.insert(entry)) return 0n;
+    return newId;
+  };
+
+  public queueSize = () => this.queue.size;
 
   public destroy = () => {
     this.connection.destroy();
     this.audioPlayer.stop();
+    unloadPlayer(this.guild.id);
   };
 
   public skip = () => {
     this.audioPlayer.stop(true);
+  };
+
+  public removeFromQueue = (id: bigint): boolean => {
+    const entry: QueueEntry = { id, youtubeId: "" };
+    return this.queue.remove(entry);
   };
 
   private checkPlay = () => {
@@ -76,6 +136,7 @@ class Player {
 
       ytdl("https://www.youtube.com/watch?v=" + nextId, {
         quality: "highestaudio",
+        filter: "audioonly",
       }).then((data) => {
         const resource = createAudioResource(data);
         this.audioPlayer.play(resource);
@@ -88,7 +149,10 @@ class Player {
   };
 
   private queuePop = (): string | undefined => {
-    return this.queue.shift();
+    const entry = this.queue.min();
+    if (entry === null) return undefined;
+    this.queue.remove(entry);
+    return entry.youtubeId;
   };
 }
 
@@ -123,11 +187,21 @@ const destroyAllPlayers = () => {
   }
 };
 
-const destroyPlayer = (guild: Guild, channel: Channel): void => {
-  const player = players.get(guild.id);
-  if (player === undefined) return;
-  player.destroy();
-  players.delete(guild.id);
+const unloadPlayer = (guildId: string) => {
+  players.delete(guildId);
 };
 
-export { getOrCreatePlayer, destroyAllPlayers, getPlayer, destroyPlayer };
+const destroyPlayer = (guild: Guild, channel: Channel): boolean => {
+  const player = players.get(guild.id);
+  if (player === undefined) return false;
+  player.destroy();
+  return true;
+};
+
+export {
+  getOrCreatePlayer,
+  destroyAllPlayers,
+  getPlayer,
+  destroyPlayer,
+  Player,
+};
