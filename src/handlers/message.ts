@@ -1,6 +1,12 @@
-import { Awaitable, Channel, Guild, Message } from "discord.js";
-import { getOrCreatePlayer, destroyPlayer, getPlayer } from "../music/player";
+import { Awaitable, Channel, Guild, Message, MessageEmbed } from "discord.js";
+import {
+  getOrCreatePlayer,
+  destroyPlayer,
+  getPlayer,
+  Player,
+} from "../music/player";
 import { createResponse } from "./common";
+import * as yt from "youtube-search-without-api-key";
 
 const isCommand = (message: Message) => {
   return message.content[0] === "$";
@@ -10,6 +16,11 @@ const getParts = (message: Message): string[] => {
   const parts = message.content.split(" ");
   parts.shift();
   return parts;
+};
+
+const getArguments = (message: Message): string => {
+  const parts = message.content.split(" ", 2);
+  return parts[1];
 };
 
 const getCommand = (message: Message): string => {
@@ -28,28 +39,44 @@ const extractId = (link: string): string => {
   return last;
 };
 
-const withGuildAndChannel = (
+const withGuildAndChannel = async (
   message: Message,
-  func: (guild: Guild, channel: Channel) => void
+  func: (guild: Guild, channel: Channel) => Awaitable<void> | boolean
 ) => {
   const guild = message.guild;
   const member = guild?.members.cache.get(message.author.id);
   const voiceChannel = member?.voice.channel;
   if (voiceChannel !== undefined && voiceChannel !== null && guild !== null) {
-    func(guild, voiceChannel);
+    await func(guild, voiceChannel);
   }
+};
+
+const withPlayer = async (
+  message: Message,
+  func: (player: Player) => Awaitable<void>
+) => {
+  await withGuildAndChannel(message, async (guild, channel) => {
+    const player = getPlayer(guild, channel);
+    if (player !== undefined) {
+      await func(player);
+    }
+  });
 };
 
 const longRegex =
   /^(https:\/\/)?(www\.)?youtube\.com\/watch\?v=[A-z0-9_\-]+((&|\?).*)?$/gi;
 const shortRegex = /^(https:\/\/)?youtu\.be\/[A-z0-9_\-]+((&|\?).*)?$/gi;
 
-const respondSuccess = (message: Message, id: bigint, queueSize: number) => {
+const respondSuccess = async (
+  message: Message,
+  id: bigint,
+  queueSize: number
+) => {
   const response = createResponse(
     `Added to the queue. Currently position #${queueSize} in the queue`,
     id
   );
-  message.reply(response);
+  await message.reply(response);
 };
 
 // https://youtu.be/5Ba2HU2mStI
@@ -58,25 +85,35 @@ const playHandler = async (message: Message) => {
   const parts = getParts(message);
   if (parts.length === 0) {
     await message.reply("No arguments provided to the command");
+    return;
   }
 
+  let youtubeId: string | undefined = undefined;
   if (
     parts.length === 1 &&
     (parts[0].match(longRegex) || parts[0].match(shortRegex))
   ) {
-    const youtubeId = extractId(parts[0]);
-    withGuildAndChannel(message, (guild, channel) => {
-      const player = getOrCreatePlayer(guild, channel, true);
+    youtubeId = extractId(parts[0]);
+  } else {
+    const query = getArguments(message);
+    const results = await yt.search(query);
+    if (results.length === 0) {
+      await message.reply("Unable to find any videos matching your search");
+    } else {
+      youtubeId = results[0].id.videoId;
+    }
+  }
+
+  if (youtubeId !== undefined) {
+    await withGuildAndChannel(message, async (guild, channel) => {
+      const player = await getOrCreatePlayer(guild, channel, true);
       if (player === undefined) {
-        message.reply("Bot is already in a channel");
+        await message.reply("Bot is already in a channel");
         return;
       }
-      const queueSize = player.queueSize() + 1;
-      const id = player.addToQueue(youtubeId);
-      respondSuccess(message, id, queueSize);
+      const { id, currentSize } = await player.addToQueue(youtubeId!);
+      await respondSuccess(message, id, currentSize);
     });
-  } else {
-    message.reply("The bot currently only supports links");
   }
 };
 
@@ -85,16 +122,30 @@ const pingHandler = async (message: Message) => {
 };
 
 const leaveHandler = async (message: Message) => {
-  withGuildAndChannel(message, destroyPlayer);
+  await withGuildAndChannel(message, destroyPlayer);
 };
 
 const skipHandler = async (message: Message) => {
-  withGuildAndChannel(message, (guild, channel) => {
-    const player = getPlayer(guild, channel);
-    if (player !== undefined) {
-      player.skip();
-    }
+  await withPlayer(message, (player) => {
+    player.skip();
   });
+};
+
+const listHandler = async (message: Message) => {
+  await withPlayer(message, async (player) => {
+    const queue = await player.getQueue();
+    const embed = new MessageEmbed().setDescription(
+      queue.map((entry, i) => `#${i + 1} ${entry.youtubeId}`).join("\n")
+    );
+    await message.reply({ embeds: [embed] });
+  });
+};
+
+const searchHandler = async (message: Message) => {
+  const search = getArguments(message);
+  const results = await yt.search(search);
+
+  results;
 };
 
 const handlers = new Map<string, (message: Message) => Awaitable<void>>([
@@ -102,6 +153,8 @@ const handlers = new Map<string, (message: Message) => Awaitable<void>>([
   ["ping", pingHandler],
   ["leave", leaveHandler],
   ["skip", skipHandler],
+  ["search", searchHandler],
+  ["list", listHandler],
 ]);
 
 const messageRouter = async (message: Message) => {
@@ -114,7 +167,7 @@ const messageRouter = async (message: Message) => {
   if (handler === undefined) {
     await message.reply(`Unknown command: ${command}`);
   } else {
-    handler(message);
+    await handler(message);
   }
 };
 

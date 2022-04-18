@@ -3,12 +3,14 @@ import {
   AudioPlayerStatus,
   createAudioPlayer,
   createAudioResource,
+  AudioResource,
   entersState,
   joinVoiceChannel,
   NoSubscriberBehavior,
   VoiceConnection,
   VoiceConnectionStatus,
 } from "@discordjs/voice";
+import { Mutex } from "async-mutex";
 import { RBTree } from "bintrees";
 import { Channel, Guild } from "discord.js";
 import ytdl from "ytdl-core-discord";
@@ -16,6 +18,13 @@ import ytdl from "ytdl-core-discord";
 interface QueueEntry {
   id: bigint;
   youtubeId: string;
+  title?: string;
+  offset?: number;
+}
+
+interface AddResult {
+  id: bigint;
+  currentSize: number;
 }
 
 class Player {
@@ -30,6 +39,12 @@ class Player {
   channelId: string;
   nextId: bigint = 1n;
   nextFrontId: bigint = -1n;
+  queueLock = new Mutex();
+  idLock = new Mutex();
+
+  // Currently playing information
+  currentResource: AudioResource | undefined = undefined;
+  youtubeId: string | undefined = undefined;
 
   constructor(guild: Guild, channel: Channel) {
     this.guild = guild;
@@ -43,6 +58,14 @@ class Player {
     this.audioPlayer.on(AudioPlayerStatus.Idle, () => {
       this.checkPlay();
     });
+    this.audioPlayer.on("error", async (error) => {
+      console.log(error);
+      if (this.currentResource !== undefined && this.youtubeId !== undefined) {
+        const offset = this.currentResource.playbackDuration;
+        const id = await this.getNextFrontId();
+        await this.queuePush({ offset, id, youtubeId: this.youtubeId });
+      }
+    });
 
     this.connection = joinVoiceChannel({
       guildId: this.guild.id,
@@ -52,30 +75,27 @@ class Player {
       selfDeaf: false,
     });
     this.connection.subscribe(this.audioPlayer);
-    this.connection.on(
-      VoiceConnectionStatus.Disconnected,
-      async (oldState, newState) => {
-        try {
-          this.channelId = "";
-          await Promise.race([
-            entersState(
-              this.connection,
-              VoiceConnectionStatus.Signalling,
-              10_000
-            ),
-            entersState(
-              this.connection,
-              VoiceConnectionStatus.Connecting,
-              10_000
-            ),
-          ]);
-          const channelId = this.connection.joinConfig.channelId;
-          if (channelId !== null) this.channelId = channelId;
-        } catch (error) {
-          this.connection.destroy();
-        }
+    this.connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      try {
+        this.channelId = "";
+        await Promise.race([
+          entersState(
+            this.connection,
+            VoiceConnectionStatus.Signalling,
+            10_000
+          ),
+          entersState(
+            this.connection,
+            VoiceConnectionStatus.Connecting,
+            10_000
+          ),
+        ]);
+        const channelId = this.connection.joinConfig.channelId;
+        if (channelId !== null) this.channelId = channelId;
+      } catch (error) {
+        this.connection.destroy();
       }
-    );
+    });
   }
 
   public setVoiceChannel = (channel: Channel, move: boolean): boolean => {
@@ -93,22 +113,21 @@ class Player {
     return true;
   };
 
-  public addToQueue = (youtubeId: string): bigint => {
-    const id = this.nextId;
-    this.nextId++;
-    this.queue.insert({ id, youtubeId });
-    this.checkPlay();
-    return id;
+  public addToQueue = async (youtubeId: string): Promise<AddResult> => {
+    const id = await this.getNextId();
+    const size = await this.queuePush({ id, youtubeId });
+    await this.checkPlay();
+    return { id, currentSize: size };
   };
 
-  public bumpToFront = (id: bigint): bigint => {
-    const entry = this.queue.find({ id, youtubeId: "" });
-    if (entry === null) return 0n;
-    if (!this.queue.remove(entry)) return 0n;
-    const newId = this.nextFrontId;
-    this.nextFrontId--;
+  public bumpToFront = async (id: bigint): Promise<bigint> => {
+    const entry = await this.queueFind(id);
+    if (entry === undefined) return 0n;
+    if (!(await this.queueRemove(entry))) return 0n;
+
+    const newId = await this.getNextFrontId();
     entry.id = newId;
-    if (!this.queue.insert(entry)) return 0n;
+    if ((await this.queuePush(entry)) === 0) return 0n;
     return newId;
   };
 
@@ -121,26 +140,42 @@ class Player {
   };
 
   public skip = () => {
-    this.audioPlayer.stop(true);
+    this.audioPlayer.stop();
   };
 
-  public removeFromQueue = (id: bigint): boolean => {
-    const entry: QueueEntry = { id, youtubeId: "" };
-    return this.queue.remove(entry);
+  public removeFromQueue = (id: bigint): Promise<boolean> => {
+    return this.queueRemove(id);
   };
 
-  private checkPlay = () => {
-    if (this.isIdle()) {
-      const nextId = this.queuePop();
-      if (nextId === undefined) return;
-
-      ytdl("https://www.youtube.com/watch?v=" + nextId, {
-        quality: "highestaudio",
-        filter: "audioonly",
-      }).then((data) => {
-        const resource = createAudioResource(data);
-        this.audioPlayer.play(resource);
+  public getQueue = async (): Promise<QueueEntry[]> => {
+    const queue: QueueEntry[] = [];
+    const release = await this.queueLock.acquire();
+    try {
+      this.queue.each((entry) => {
+        queue.push(Object.assign({}, entry));
       });
+    } finally {
+      release();
+    }
+    return queue;
+  };
+
+  private checkPlay = async () => {
+    if (this.isIdle()) {
+      const nextEntry = await this.queuePop();
+      if (nextEntry === undefined) return;
+      const { youtubeId, offset } = nextEntry;
+      const stream = await ytdl(
+        "https://www.youtube.com/watch?v=" + youtubeId,
+        {
+          begin: offset,
+          quality: "highestaudio",
+          filter: "audioonly",
+        }
+      );
+      this.youtubeId = youtubeId;
+      this.currentResource = createAudioResource(stream);
+      this.audioPlayer.play(this.currentResource);
     }
   };
 
@@ -148,29 +183,111 @@ class Player {
     return this.audioPlayer.state.status === AudioPlayerStatus.Idle;
   };
 
-  private queuePop = (): string | undefined => {
-    const entry = this.queue.min();
-    if (entry === null) return undefined;
-    this.queue.remove(entry);
-    return entry.youtubeId;
+  private queuePop = async (): Promise<QueueEntry | undefined> => {
+    const release = await this.queueLock.acquire();
+    try {
+      const entry = this.queue.min();
+      if (entry === null) return undefined;
+      this.queue.remove(entry);
+      return entry;
+    } finally {
+      release();
+    }
+  };
+
+  private queuePush = async (entry: QueueEntry): Promise<number> => {
+    const release = await this.queueLock.acquire();
+    try {
+      const newSize = this.queueSize() + 1;
+      if (!this.queue.insert(entry)) return 0;
+      return newSize;
+    } finally {
+      release();
+    }
+  };
+
+  private queueRemove = async (
+    entry: QueueEntry | bigint
+  ): Promise<boolean> => {
+    if (typeof entry === "bigint") {
+      entry = {
+        id: entry,
+        youtubeId: "",
+      };
+    }
+
+    const release = await this.queueLock.acquire();
+    try {
+      return this.queue.remove(entry);
+    } finally {
+      release();
+    }
+  };
+
+  private queueFind = async (
+    entry: QueueEntry | bigint
+  ): Promise<QueueEntry | undefined> => {
+    if (typeof entry === "bigint") {
+      entry = {
+        id: entry,
+        youtubeId: "",
+      };
+    }
+
+    const release = await this.queueLock.acquire();
+    try {
+      const result = this.queue.find(entry);
+      if (result === null) return undefined;
+      return result;
+    } finally {
+      release();
+    }
+  };
+
+  private getNextId = async () => {
+    const release = await this.idLock.acquire();
+    try {
+      const id = this.nextId;
+      this.nextId++;
+      return id;
+    } finally {
+      release();
+    }
+  };
+
+  private getNextFrontId = async () => {
+    const release = await this.idLock.acquire();
+    try {
+      const id = this.nextFrontId;
+      this.nextFrontId--;
+      return id;
+    } finally {
+      release();
+    }
   };
 }
 
+const playersLock = new Mutex();
 const players: Map<string, Player> = new Map();
 
-const getOrCreatePlayer = (
+const getOrCreatePlayer = async (
   guild: Guild,
   channel: Channel,
   moveChannel: boolean = false
-): Player | undefined => {
-  const player = players.get(guild.id);
-  if (player !== undefined) {
-    if (!player.setVoiceChannel(channel, moveChannel)) return undefined;
-    return player;
+): Promise<Player | undefined> => {
+  const release = await playersLock.acquire();
+  try {
+    const player = players.get(guild.id);
+    if (player !== undefined) {
+      if (!player.setVoiceChannel(channel, moveChannel)) return undefined;
+      return player;
+    }
+    const newPlayer = new Player(guild, channel);
+    players.set(guild.id, newPlayer);
+    return newPlayer;
+  } finally {
+    release();
   }
-  const newPlayer = new Player(guild, channel);
-  players.set(guild.id, newPlayer);
-  return newPlayer;
 };
 
 const getPlayer = (guild: Guild, channel: Channel): Player | undefined => {
@@ -204,4 +321,5 @@ export {
   getPlayer,
   destroyPlayer,
   Player,
+  QueueEntry,
 };

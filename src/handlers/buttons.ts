@@ -7,30 +7,30 @@ interface Handler {
   func: (message: ButtonInteraction) => Awaitable<void>;
 }
 
-const withGuildAndChannel = (
+const withGuildAndChannel = async (
   message: ButtonInteraction,
-  func: (guild: Guild, channel: Channel) => void
+  func: (guild: Guild, channel: Channel) => Awaitable<void>
 ) => {
   const guild = message.guild;
   const member = guild?.members.cache.get(message.user.id);
   const voiceChannel = member?.voice.channel;
   if (voiceChannel !== undefined && voiceChannel !== null && guild !== null) {
-    func(guild, voiceChannel);
+    await func(guild, voiceChannel);
   }
 };
 
-const withPlayer = (
+const withPlayer = async (
   message: ButtonInteraction,
-  func: (player: Player) => void
+  func: (player: Player) => Awaitable<void>
 ) => {
-  withGuildAndChannel(message, (guild, channel) => {
+  await withGuildAndChannel(message, async (guild, channel) => {
     const player = getPlayer(guild, channel);
     if (player === undefined) return;
-    func(player);
+    await func(player);
   });
 };
 
-const updateMessage = (
+const updateMessage = async (
   message: ButtonInteraction,
   id: bigint = 0n,
   deleted: boolean = false,
@@ -38,16 +38,16 @@ const updateMessage = (
 ) => {
   const oldMessage = message.message.content;
   const newMessage = createResponse(oldMessage, id, deleted, bumped);
-  message.update(newMessage);
+  await message.update(newMessage);
 };
 
 const removeSongMatch = /^song_remove_(-)?[0-9]+$/gi;
-const removeSong = (message: ButtonInteraction) => {
+const removeSong = async (message: ButtonInteraction) => {
   const splits = message.customId.split("_");
   const id = BigInt(splits[splits.length - 1]);
-  withPlayer(message, (player) => {
-    updateMessage(message, 0n, true);
-    player.removeFromQueue(id);
+  withPlayer(message, async (player) => {
+    await updateMessage(message, 0n, true);
+    await player.removeFromQueue(id);
   });
 };
 
@@ -55,12 +55,12 @@ const bumpSongMatch = /^song_bump_(-)?[0-9]+$/gi;
 const bumpSong = (message: ButtonInteraction) => {
   const splits = message.customId.split("_");
   const id = BigInt(splits[splits.length - 1]);
-  withPlayer(message, (player) => {
-    const newId = player.bumpToFront(id);
+  withPlayer(message, async (player) => {
+    const newId = await player.bumpToFront(id);
     if (newId !== 0n) {
-      updateMessage(message, newId, false, true);
+      await updateMessage(message, newId, false, true);
     } else {
-      updateMessage(message, 0n, true);
+      await updateMessage(message, 0n, true);
     }
   });
 };
@@ -74,7 +74,7 @@ const buttonRouter = async (message: ButtonInteraction) => {
   const customId = message.customId;
   for (const { match, func } of handlers) {
     if (customId.match(match)) {
-      func(message);
+      await func(message);
       break;
     }
   }
