@@ -9,6 +9,7 @@ import {
   NoSubscriberBehavior,
   VoiceConnection,
   VoiceConnectionStatus,
+  StreamType,
 } from "@discordjs/voice";
 import { Mutex } from "async-mutex";
 import { RBTree } from "bintrees";
@@ -19,7 +20,6 @@ interface QueueEntry {
   id: bigint;
   youtubeId: string;
   title?: string;
-  offset?: number;
 }
 
 interface AddResult {
@@ -55,16 +55,11 @@ class Player {
         noSubscriber: NoSubscriberBehavior.Play,
       },
     });
-    this.audioPlayer.on(AudioPlayerStatus.Idle, () => {
-      this.checkPlay();
+    this.audioPlayer.on(AudioPlayerStatus.Idle, async () => {
+      await this.checkPlay();
     });
-    this.audioPlayer.on("error", async (error) => {
-      console.log(error);
-      if (this.currentResource !== undefined && this.youtubeId !== undefined) {
-        const offset = this.currentResource.playbackDuration;
-        const id = await this.getNextFrontId();
-        await this.queuePush({ offset, id, youtubeId: this.youtubeId });
-      }
+    this.audioPlayer.on("error", async (_) => {
+      console.log("An error occurred while playing " + this.youtubeId);
     });
 
     this.connection = joinVoiceChannel({
@@ -164,17 +159,19 @@ class Player {
     if (this.isIdle()) {
       const nextEntry = await this.queuePop();
       if (nextEntry === undefined) return;
-      const { youtubeId, offset } = nextEntry;
+      const { youtubeId } = nextEntry;
       const stream = await ytdl(
         "https://www.youtube.com/watch?v=" + youtubeId,
         {
-          begin: offset,
+          highWaterMark: 1 << 25,
           quality: "highestaudio",
           filter: "audioonly",
         }
       );
       this.youtubeId = youtubeId;
-      this.currentResource = createAudioResource(stream);
+      this.currentResource = createAudioResource(stream, {
+        inputType: StreamType.Opus,
+      });
       this.audioPlayer.play(this.currentResource);
     }
   };
