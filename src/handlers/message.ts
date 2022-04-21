@@ -13,18 +13,17 @@ const isCommand = (message: Message) => {
 };
 
 const getParts = (message: Message): string[] => {
-  const parts = message.content.split(" ");
-  parts.shift();
-  return parts;
+  const [_, ...rest] = message.content.split(" ");
+  return rest;
 };
 
 const getArguments = (message: Message): string => {
-  const parts = message.content.split(" ", 2);
-  return parts[1];
+  const [_, ...rest] = message.content.split(" ");
+  return rest.join(" ");
 };
 
 const getCommand = (message: Message): string => {
-  return message.content.split(" ")[0].substring(1);
+  return message.content.split(" ", 1)[0].substring(1);
 };
 
 const extractId = (link: string): string => {
