@@ -14,13 +14,22 @@ import {
 import { Mutex } from "async-mutex";
 import { RBTree } from "bintrees";
 import { Channel, Guild } from "discord.js";
+import shuffleArray from "shuffle-array";
 import ytdl from "ytdl-core-discord";
 
-interface QueueEntry {
-  id: bigint;
+interface VideoInformation {
   youtubeId: string;
-  title?: string;
+  title: string;
+  duration: string;
 }
+
+type QueueEntry = VideoInformation & {
+  id: bigint;
+};
+
+const createEmptyEntry = (id: bigint): QueueEntry => {
+  return { id, youtubeId: "", title: "", duration: "" };
+};
 
 interface AddResult {
   id: bigint;
@@ -41,8 +50,11 @@ class Player {
   nextFrontId: bigint = -1n;
   queueLock = new Mutex();
   idLock = new Mutex();
+  playLock = new Mutex();
+  playlist: VideoInformation[];
+  playlistIdx: number;
 
-  // Currently playing information
+  // Currently playing informationcheckPlay
   currentResource: AudioResource | undefined = undefined;
   youtubeId: string | undefined = undefined;
 
@@ -91,6 +103,9 @@ class Player {
         this.connection.destroy();
       }
     });
+
+    this.playlist = [];
+    this.playlistIdx = 0;
   }
 
   public setVoiceChannel = (channel: Channel, move: boolean): boolean => {
@@ -108,9 +123,25 @@ class Player {
     return true;
   };
 
-  public addToQueue = async (youtubeId: string): Promise<AddResult> => {
+  public setPlaylist = async (videos: VideoInformation[]) => {
+    const release = await this.playLock.acquire();
+    try {
+      this.playlist = videos;
+      this.playlistIdx = 0;
+    } finally {
+      release();
+    }
+    this.checkPlay();
+  };
+
+  public addToQueue = async (info: VideoInformation): Promise<AddResult> => {
     const id = await this.getNextId();
-    const size = await this.queuePush({ id, youtubeId });
+    const size = await this.queuePush({
+      id,
+      youtubeId: info.youtubeId,
+      title: info.title,
+      duration: info.duration,
+    });
     await this.checkPlay();
     return { id, currentSize: size };
   };
@@ -134,8 +165,25 @@ class Player {
     unloadPlayer(this.guild.id);
   };
 
+  public play = async () => {
+    await this.checkPlay();
+  };
+
+  public pause = async () => {
+    this.audioPlayer.pause();
+  };
+
   public skip = () => {
     this.audioPlayer.stop();
+  };
+
+  public shuffle = async () => {
+    const release = await this.playLock.acquire();
+    try {
+      this.playlist = shuffleArray(this.playlist);
+    } finally {
+      release();
+    }
   };
 
   public removeFromQueue = (id: bigint): Promise<boolean> => {
@@ -156,23 +204,38 @@ class Player {
   };
 
   private checkPlay = async () => {
-    if (this.isIdle()) {
-      const nextEntry = await this.queuePop();
-      if (nextEntry === undefined) return;
-      const { youtubeId } = nextEntry;
-      const stream = await ytdl(
-        "https://www.youtube.com/watch?v=" + youtubeId,
-        {
-          highWaterMark: 1 << 25,
-          quality: "highestaudio",
-          filter: "audioonly",
+    const release = await this.playLock.acquire();
+    try {
+      if (this.isIdle()) {
+        let nextEntry: VideoInformation | undefined = await this.queuePop();
+        if (nextEntry === undefined) {
+          if (this.playlist.length > 0) {
+            if (this.playlistIdx > this.playlist.length) this.playlistIdx = 0;
+            nextEntry = this.playlist[this.playlistIdx];
+            this.playlistIdx++;
+          } else {
+            return;
+          }
         }
-      );
-      this.youtubeId = youtubeId;
-      this.currentResource = createAudioResource(stream, {
-        inputType: StreamType.Opus,
-      });
-      this.audioPlayer.play(this.currentResource);
+        const { youtubeId } = nextEntry;
+        const stream = await ytdl(
+          "https://www.youtube.com/watch?v=" + youtubeId,
+          {
+            highWaterMark: 1 << 25,
+            quality: "highestaudio",
+            filter: "audioonly",
+          }
+        );
+        this.youtubeId = youtubeId;
+        this.currentResource = createAudioResource(stream, {
+          inputType: StreamType.Opus,
+        });
+        this.audioPlayer.play(this.currentResource);
+      } else if (this.audioPlayer.checkPlayable()) {
+        this.audioPlayer.unpause();
+      }
+    } finally {
+      release();
     }
   };
 
@@ -207,10 +270,7 @@ class Player {
     entry: QueueEntry | bigint
   ): Promise<boolean> => {
     if (typeof entry === "bigint") {
-      entry = {
-        id: entry,
-        youtubeId: "",
-      };
+      entry = createEmptyEntry(entry);
     }
 
     const release = await this.queueLock.acquire();
@@ -225,10 +285,7 @@ class Player {
     entry: QueueEntry | bigint
   ): Promise<QueueEntry | undefined> => {
     if (typeof entry === "bigint") {
-      entry = {
-        id: entry,
-        youtubeId: "",
-      };
+      entry = createEmptyEntry(entry);
     }
 
     const release = await this.queueLock.acquire();
@@ -319,4 +376,5 @@ export {
   destroyPlayer,
   Player,
   QueueEntry,
+  VideoInformation,
 };

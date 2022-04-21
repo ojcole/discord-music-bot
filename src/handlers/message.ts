@@ -4,9 +4,17 @@ import {
   destroyPlayer,
   getPlayer,
   Player,
+  VideoInformation,
 } from "../music/player";
 import { createResponse } from "./common";
-import * as yt from "youtube-search-without-api-key";
+import ytdl from "ytdl-core";
+import ytpl from "ytpl";
+import ytsr from "ytsr";
+
+interface Playlist {
+  title: string;
+  items: VideoInformation[];
+}
 
 const isCommand = (message: Message) => {
   return message.content[0] === "$";
@@ -62,6 +70,20 @@ const withPlayer = async (
   });
 };
 
+const withOrCreatePlayer = async (
+  message: Message,
+  func: (player: Player) => Awaitable<void>
+) => {
+  await withGuildAndChannel(message, async (guild, channel) => {
+    const player = await getOrCreatePlayer(guild, channel, true);
+    if (player === undefined) {
+      await message.reply("Bot is already in a channel");
+      return;
+    }
+    await func(player);
+  });
+};
+
 const longRegex =
   /^(https:\/\/)?(www\.)?youtube\.com\/watch\?v=[A-z0-9_\-]+((&|\?).*)?$/gi;
 const shortRegex = /^(https:\/\/)?youtu\.be\/[A-z0-9_\-]+((&|\?).*)?$/gi;
@@ -69,17 +91,32 @@ const shortRegex = /^(https:\/\/)?youtu\.be\/[A-z0-9_\-]+((&|\?).*)?$/gi;
 const respondSuccess = async (
   message: Message,
   id: bigint,
-  queueSize: number
+  queueSize: number,
+  info: VideoInformation
 ) => {
+  const { title, duration } = info;
   const response = createResponse(
-    `Added to the queue. Currently position #${queueSize} in the queue`,
+    `:notes: **${title}** (\`${duration}\`) added to the queue at **Position #${queueSize}** :notes:`,
     id
   );
   await message.reply(response);
 };
 
-// https://youtu.be/5Ba2HU2mStI
-// https://www.youtube.com/watch?v=5Ba2HU2mStI
+const durationToString = (duration: number) => {
+  const hours = Math.trunc(duration / 3600);
+  const remaining = duration % 3600;
+  const minutes = Math.trunc(remaining / 60);
+  const seconds = remaining % 60;
+  let strDuration = "";
+  if (hours > 0) {
+    strDuration += `${hours}:` + `${minutes}:`.padStart(2, "0");
+  } else {
+    strDuration += `${minutes}:`;
+  }
+  strDuration += `${seconds}`.padStart(2, "0");
+  return strDuration;
+};
+
 const playHandler = async (message: Message) => {
   const parts = getParts(message);
   if (parts.length === 0) {
@@ -88,32 +125,170 @@ const playHandler = async (message: Message) => {
   }
 
   let youtubeId: string | undefined = undefined;
+  let title: string | undefined = undefined;
+  let duration: string | undefined = undefined;
   if (
     parts.length === 1 &&
     (parts[0].match(longRegex) || parts[0].match(shortRegex))
   ) {
     youtubeId = extractId(parts[0]);
+    try {
+      const information = await ytdl.getBasicInfo(parts[0]);
+      title = information.videoDetails.title;
+      duration = durationToString(
+        parseInt(information.videoDetails.lengthSeconds, 10)
+      );
+    } catch (err) {
+      console.log("Invalid link");
+      return;
+    }
   } else {
     const query = getArguments(message);
-    const results = await yt.search(query);
+    const filter = await ytsr.getFilters(query);
+    let newURL = filter.get("Type")?.get("Video")?.url;
+    if (newURL === undefined || newURL === null) {
+      newURL = query;
+    }
+    const results = (await ytsr(newURL, { limit: 10 })).items;
     if (results.length === 0) {
       await message.reply("Unable to find any videos matching your search");
     } else {
-      youtubeId = results[0].id.videoId;
+      for (const result of results) {
+        if (result.type === "video" && !result.isLive) {
+          youtubeId = result.id;
+          title = result.title;
+          duration = `${result.duration}`;
+          break;
+        }
+      }
     }
   }
 
-  if (youtubeId !== undefined) {
-    await withGuildAndChannel(message, async (guild, channel) => {
-      const player = await getOrCreatePlayer(guild, channel, true);
-      if (player === undefined) {
-        await message.reply("Bot is already in a channel");
-        return;
-      }
-      const { id, currentSize } = await player.addToQueue(youtubeId!);
-      await respondSuccess(message, id, currentSize);
+  if (
+    youtubeId !== undefined &&
+    title !== undefined &&
+    duration !== undefined
+  ) {
+    await withOrCreatePlayer(message, async (player) => {
+      const info: VideoInformation = {
+        youtubeId: youtubeId!,
+        title: title!,
+        duration: duration!,
+      };
+      const { id, currentSize } = await player.addToQueue(info);
+      await respondSuccess(message, id, currentSize, info);
     });
   }
+};
+
+const extractPlaylistId = (playlistURL: string) => {
+  const parts = playlistURL.split("?list=");
+  let last = parts[parts.length - 1];
+  last = last.split("&")[0];
+  return last;
+};
+
+const ytplItemsToVideos = (items: ytpl.Item[], base: VideoInformation[]) => {
+  items
+    .filter((item) => !item.isLive)
+    .forEach((item) =>
+      base.push({
+        youtubeId: item.id,
+        title: item.title,
+        duration: item.duration || "Unknown",
+      })
+    );
+};
+
+const playlistLoadAll = async (playlistId: string): Promise<Playlist> => {
+  const base = await ytpl(playlistId, { pages: 1 });
+  const result: Playlist = {
+    title: base.title,
+    items: [],
+  };
+  ytplItemsToVideos(base.items, result.items);
+
+  let nextContinuation = base.continuation;
+  while (nextContinuation !== null) {
+    try {
+      const next = await ytpl.continueReq(nextContinuation);
+      nextContinuation = next.continuation;
+      ytplItemsToVideos(next.items, result.items);
+    } catch (err) {
+      break;
+    }
+  }
+
+  return result;
+};
+
+const playlistRegex =
+  /^(https:\/\/)?(www\.)?youtube\.com\/playlist\?list=[A-z0-9_\-]+((&|\?).*)?$/gi;
+const playlistHandler = async (message: Message) => {
+  const parts = getParts(message);
+  if (parts.length === 0) {
+    await message.reply("No arguments provided to the command");
+    return;
+  }
+
+  let playlistId: string | undefined = undefined;
+
+  if (parts.length === 1 && parts[0].match(playlistRegex)) {
+    playlistId = extractPlaylistId(parts[0]);
+  } else {
+    const query = getArguments(message);
+    const filter = await ytsr.getFilters(query);
+    const newUrl = filter.get("Type")?.get("Playlist")?.url;
+    if (newUrl === undefined || newUrl === null) {
+      return;
+    }
+    const results = (await ytsr(newUrl, { limit: 10 })).items;
+    for (const result of results) {
+      if (result.type === "playlist") {
+        playlistId = result.playlistID;
+        break;
+      }
+    }
+  }
+
+  if (playlistId !== undefined) {
+    try {
+      const { title, items } = await playlistLoadAll(playlistId);
+      await withOrCreatePlayer(message, async (player) => {
+        await player.setPlaylist(items);
+      });
+      await message.reply(
+        `:notes: **${title}** (\`${items.length}\` songs) set as the current playlist :notes:`
+      );
+    } catch (err) {
+      console.log("Playlist not found");
+    }
+  }
+};
+
+const removePlaylistHandler = async (message: Message) => {
+  await withPlayer(message, async (player) => {
+    await player.setPlaylist([]);
+  });
+};
+
+const pauseHandler = async (message: Message) => {
+  await withPlayer(message, async (player) => {
+    await player.pause();
+  });
+};
+
+const resumeHandler = async (message: Message) => {
+  await withPlayer(message, async (player) => {
+    await player.play();
+  });
+};
+
+const shuffleHandler = async (message: Message) => {
+  await withPlayer(message, async (player) => {
+    await player.shuffle();
+    await message.reply("Shuffled playlist");
+  });
 };
 
 const pingHandler = async (message: Message) => {
@@ -133,16 +308,21 @@ const skipHandler = async (message: Message) => {
 const listHandler = async (message: Message) => {
   await withPlayer(message, async (player) => {
     const queue = await player.getQueue();
-    const embed = new MessageEmbed().setDescription(
-      queue.map((entry, i) => `#${i + 1} ${entry.youtubeId}`).join("\n")
-    );
-    await message.reply({ embeds: [embed] });
+    if (queue.length > 0) {
+      const embed = new MessageEmbed().setDescription(
+        queue.map((entry, i) => `#${i + 1} ${entry.youtubeId}`).join("\n")
+      );
+      await message.reply({ embeds: [embed] });
+    } else {
+      await message.reply("The queue is currently empty");
+    }
   });
 };
 
 const searchHandler = async (message: Message) => {
   const search = getArguments(message);
-  const results = await yt.search(search);
+  // TODO filter
+  const results = (await ytsr(search)).items;
 
   results;
 };
@@ -154,6 +334,11 @@ const handlers = new Map<string, (message: Message) => Awaitable<void>>([
   ["skip", skipHandler],
   ["search", searchHandler],
   ["list", listHandler],
+  ["playlist", playlistHandler],
+  ["removeplaylist", removePlaylistHandler],
+  ["shuffle", shuffleHandler],
+  ["resume", resumeHandler],
+  ["pause", pauseHandler],
 ]);
 
 const messageRouter = async (message: Message) => {
